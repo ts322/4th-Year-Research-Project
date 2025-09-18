@@ -1,0 +1,43 @@
+/*---------------------------------------------------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2506                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+Build  : _615aae61-20250627 OPENFOAM=2506 version=2506
+Arch   : "LSB;label=32;scalar=64"
+Exec   : blockMesh
+Date   : Sep 18 2025
+Time   : 15:11:40
+Host   : IC-5CG220768S
+PID    : 282214
+I/O    : uncollated
+Case   : /home/ts322/ResearchProject/4th-Year-Research-Project/2D_Reactor/Results_2025-09-18_15-11
+nProcs : 1
+trapFpe: Floating point exception trapping enabled (FOAM_SIGFPE).
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 5, maxFileModificationPolls 20)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Creating block mesh from "system/blockMeshDict"
+Creating block edges
+No non-planar block faces defined
+Creating topology blocks
+
+Creating topology patches - from boundary section
+
+
+--> FOAM FATAL IO ERROR: (openfoam-2506)
+incorrect first token, expected <int> or '(', found on line 1186: word '\t'
+
+
+file: outlet/faces at line 1186.
+
+    From void Foam::blockMeshTools::read(Foam::Istream&, Foam::List<T>&, const Foam::dictionary&) [with T = int]
+    in file lnInclude/blockMeshToolsTemplates.C at line 92.
+
+FOAM exiting
+
