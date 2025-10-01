@@ -3,249 +3,365 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
 from scipy import interpolate
-import shutil 
+import shutil
 import os
 import sys
 sys.path.insert(1, os.path.join(sys.path[0], ".."))
-#sys.path.insert(1, '/home/nmehboob/ROM-parametric')
 from scipy.stats import qmc
 from datetime import datetime
 import math
 import uuid
 import subprocess
 
-#ToDo: fix inlet and outlet width of the channel. 
-#ToDo: way to generate a single image from lots of images in the folders. 
+# -------------------------
+# Tunables / Project params
+# -------------------------
+THICKNESS = 0.1                 # z-thickness of the channel
+TARGET_END_WIDTH = 0.5          # enforce inlet/outlet width (top - bottom) at both ends
+MIN_GAP = 0.02                  # minimal gap between top and bottom everywhere (safety)
+PLOT_GEOMETRY = True
+DELETE_ON_SEVERE = True         # delete only on severe issues (zero/neg volume/area, bad orientation)
+N_ADD = 50                      # number of points added at each end
+BASE_N = 180                    # base number of points along the core section
 
-def sin_line(x, b, a, c,off):
-    return b + (a * np.sin(c * (x-off)))
+# ------------------------------------------------
+# Helpers
+# ------------------------------------------------
+def sin_line(x, b, a, c, off):
+    return b + (a * np.sin(c * (x - off)))
 
-def smooth(x,y,n_add):
-    k = 5
-    x_p = [x[n_add-k],x[n_add],x[n_add+k]]
-    y_mid_new = (((y[n_add-k] + y[n_add+k])/2) + y[n_add])/2
-    y_p = [y[n_add-k],y_mid_new,y[n_add+k]]
-    #print(y_mid_new)
-    x_new = np.linspace(x[n_add-k],x[n_add+k],2*k)
-    y_new = interp1d(x_p,y_p,kind='quadratic')(x_new)
+def smooth_local(x, y, idx, k=5):
+    """
+    Smooth a small neighborhood around index 'idx' using quadratic interpolation.
+    Keeps x monotonic and avoids ringing.
+    """
+    i0 = max(idx - k, 0)
+    i2 = min(idx + k, len(x)-1)
+    xm = [x[i0], x[idx], x[i2]]
+    ym = [y[i0], ((y[i0] + y[i2]) * 0.5 + y[idx]) * 0.5, y[i2]]
+    x_new = np.linspace(x[i0], x[i2], (i2 - i0) + 1)
+    y_new = interp1d(xm, ym, kind='quadratic')(x_new)
 
-    x[n_add-k:n_add+k] = x_new
-    y[n_add-k:n_add+k] = y_new
-    return x,y
+    # splice
+    x[i0:i2+1] = x_new
+    y[i0:i2+1] = y_new
+    return x, y
 
+def format_point(x, y, z):
+    # keep numbers readable and stable for OpenFOAM
+    return f"({x:.8f} {y:.8f} {z:.8f})"
 
+def dedupe_str_points(seq):
+    """Remove consecutive duplicate string points."""
+    out = []
+    last = None
+    for s in seq:
+        if s != last:
+            out.append(s)
+            last = s
+    return out
+
+def find_block(lines, key):
+    """
+    Find an OpenFOAM dictionary block by header 'key' and return (start_idx, open_idx, end_idx).
+    Expects structure:
+      key
+      (
+        ...
+      );
+    or: key ( ... );
+    """
+    start = None
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith(key):
+            start = i
+            break
+    if start is None:
+        raise RuntimeError(f"Couldn't find '{key}' block in blockMeshDict")
+
+    # Determine where '(' is
+    has_inline_open = "(" in lines[start]
+    open_idx = start if has_inline_open else start + 1
+    # Find corresponding ');'
+    end_idx = None
+    for j in range(open_idx, len(lines)):
+        if lines[j].strip() == ");":
+            end_idx = j
+            break
+    if end_idx is None:
+        raise RuntimeError(f"Couldn't find end of '{key}' block (');')")
+    return start, open_idx, end_idx
+
+# ------------------------------------------------
+# Geometry builder
+# ------------------------------------------------
 def build_arrays(p1, p2, p3):
-    x = np.linspace(0, 3, 180)
-    # p1 = 0.25 # 0.1 <-> 0.4
-    # p2 = 5    # 3 <-> 6
+    """
+    Return:
+      x_line, y_top, y_bot, and polyline point strings for OpenFOAM:
+      l11: top, z=0     (edge 3 2)
+      l12: top, z=THK   (edge 7 6)
+      l21: bottom, z=0  (edge 0 1)
+      l22: bottom, z=THK (edge 4 5)
+    All arrays are strictly increasing in x and the top is always above bottom.
+    """
+    # basic validity
+    if not (0.1 <= p1 <= 0.5):
+        raise ValueError(f"p1 out of range [0.1, 0.5]: {p1}")
+    if not (3.0 <= p2 <= 6.0):
+        raise ValueError(f"p2 out of range [3, 6]: {p2}")
+    if not (0.0 <= p3 <= np.pi/2):
+        raise ValueError(f"p3 out of range [0, pi/2]: {p3}")
 
-    if p1 > 0.70:
-        print("--- You have entered an invalid geometry ---")
-        print("The value of p1 is too high (", p1, "> 0.70 )")
-        return
+    # Base x in [0, 3]
+    x_core = np.linspace(0.0, 3.0, BASE_N)
 
-    if p1 < 0.1:
-        print("--- You have entered an invalid geometry ---")
-        print("The value of p1 is too low (", p1, "< 0.1 )")
-        return
+    # Sine walls
+    y_top_core = sin_line(x_core, 0.5, p1, p2, p3)     # top
+    y_bot_core = sin_line(x_core, 0.0, 0.25, p2, p3)   # bottom
 
-    if p2 < 3:
-        print("--- You have entered an invalid geometry ---")
-        print("The value of p2 is too low (", p2, "< 3 )")
-        return
+    # End extensions: strictly increasing!
+    add_start_x = np.linspace(x_core[0] - 1.0, x_core[0], N_ADD + 1, endpoint=True)[:-1]
+    add_end_x   = np.linspace(x_core[-1], x_core[-1] + 1.0, N_ADD + 1, endpoint=True)[1:]
 
-    if p2 > 6:
-        print("--- You have entered an invalid geometry ---")
-        print("The value of p2 is too high (", p2, "> 6 )")
-        return
-    
-    if p3 < 0:
-        print("--- You have entered an invalid geometry ---")
-        print("The value of p3 is too low (", p3, "< 0 )")
-        return 
+    # Build start/end y for top to enforce consistent inlet/outlet width
+    y_top_start_L = y_bot_core[0] + TARGET_END_WIDTH
+    y_top_end_R   = y_bot_core[-1] + TARGET_END_WIDTH
 
-    if p3 > np.pi/2:
-        print("--- You have entered an invalid geometry ---")
-        print("The value of p3 is too high (", p3, "> pi/2 )")
-        return 
+    # Linear transitions for top only (bottom held constant on the pads)
+    f_y1_start = interpolate.interp1d(
+        [add_start_x[0], add_start_x[-1]],
+        [y_top_start_L,  y_top_core[0]],
+        kind='linear'
+    )
+    f_y1_end = interpolate.interp1d(
+        [add_end_x[0], add_end_x[-1]],
+        [y_top_core[-1], y_top_end_R],
+        kind='linear'
+    )
 
-    y1 = sin_line(x, 0.5, p1, p2,p3)
-    y2 = sin_line(x, 0.0, 0.25, p2,p3)
+    y_top = np.concatenate([f_y1_start(add_start_x), y_top_core, f_y1_end(add_end_x)])
+    y_bot = np.concatenate([np.full_like(add_start_x, y_bot_core[0]), y_bot_core, np.full_like(add_end_x, y_bot_core[-1])])
+    x_all = np.concatenate([add_start_x, x_core, add_end_x])
 
-    x1 = x 
-    x2 = x
-    n_add = 50
-    add_start_x = list(np.linspace(x1[0]-1.0,x1[0],n_add,endpoint=False))
-    add_end_x = list(np.flip(np.linspace(x1[-1]+1.0,x1[-1],n_add,endpoint=False)))
+    # Smooth a little around the two junctions to reduce kinks
+    x_all, y_top = smooth_local(x_all, y_top, idx=N_ADD)           # left junction
+    x_all, y_bot = smooth_local(x_all, y_bot, idx=N_ADD)
+    x_all, y_top = smooth_local(x_all, y_top, idx=N_ADD + BASE_N)  # right junction
+    x_all, y_bot = smooth_local(x_all, y_bot, idx=N_ADD + BASE_N)
 
-    y1_B= y1[0]
-    y1_A= y2[0]+0.5
-    add_start_y1= [0]*len(add_start_x)
-    add_start_y1[0]= y1_A; add_start_y1[-1]=y1_B
-    f_y1_start = interpolate.interp1d([add_start_x[0], add_start_x[-1]], [add_start_y1[0], add_start_y1[-1]], kind='linear')
+    # Safety: enforce minimal gap everywhere to avoid collapse
+    y_top = np.maximum(y_top, y_bot + MIN_GAP)
 
-    y1_C= y1[-1]
-    y1_D= y2[-1]+0.5
-    add_end_y1 = [0] * len(add_end_x)
-    add_end_y1[0]= y1_C; add_end_y1[-5:]=[y1_D]*5
- 
-    f_y1_end = interpolate.interp1d([add_end_x[0], add_end_x[-1]], [add_end_y1[0], add_end_y1[-1]], kind='linear')
-    #y1 = np.append(np.append([y1[0] for i in range(n_add)],y1),[y1[-1]for i in range(n_add)])#edit this
-    
-    y1 = np.append(np.append(f_y1_start(add_start_x),y1),f_y1_end(add_end_x))
-    y2 = np.append(np.append([y2[0] for i in range(n_add)],y2),[y2[-1] for i in range(n_add)])
+    # Final sanity: x must be strictly increasing
+    if not np.all(np.diff(x_all) > 0):
+        # As a last resort, sort by x and reorder top/bottom to match
+        order = np.argsort(x_all)
+        x_all = x_all[order]
+        y_top = y_top[order]
+        y_bot = y_bot[order]
+        # and ensure strict monotonicity by nudging duplicates (shouldn't normally happen)
+        dx = np.diff(x_all)
+        if np.any(dx <= 0):
+            eps = 1e-9
+            for i in range(1, len(x_all)):
+                if x_all[i] <= x_all[i-1]:
+                    x_all[i] = x_all[i-1] + eps
 
-    end= len(y1)
-    print('y1 start1 and y1 end1',y1[0],y2[0])
-    print('width',(y1[0]+abs(y2[0])))
+    # Build OpenFOAM point strings
+    l11 = [format_point(x_all[i], y_top[i], 0.0)     for i in range(len(x_all))]  # top z=0
+    l12 = [format_point(x_all[i], y_top[i], THICKNESS) for i in range(len(x_all))]  # top z=THICKNESS
+    l21 = [format_point(x_all[i], y_bot[i], 0.0)     for i in range(len(x_all))]  # bottom z=0
+    l22 = [format_point(x_all[i], y_bot[i], THICKNESS) for i in range(len(x_all))]  # bottom z=THICKNESS
 
-    x1 = np.append(np.append(add_start_x,x1),add_end_x)
-    x2 = np.append(np.append(add_start_x,x2),add_end_x)
+    # Remove any consecutive duplicates (paranoia)
+    l11 = dedupe_str_points(l11)
+    l12 = dedupe_str_points(l12)
+    l21 = dedupe_str_points(l21)
+    l22 = dedupe_str_points(l22)
 
-    x1,y1 = smooth(x1,y1,n_add)
-    x2,y2 = smooth(x2,y2,n_add)
-    x1,y1 = smooth(x1,y1,n_add+180)
-    x2,y2 = smooth(x2,y2,n_add+180)
+    return l11, l12, l21, l22, x_all, y_top, y_bot
 
-    l11 = [
-        """(\t""" + str(x1[i]) + "\t" + str(y1[i]) + """\t0\t)"""
-        for i in range(len(x1))
-    ]
-    l12 = [
-        """(\t""" + str(x1[i]) + "\t" + str(y1[i]) + """\t0.1\t)"""
-        for i in range(len(x1))
-    ]
+# ------------------------------------------------
+# Mesh writer
+# ------------------------------------------------
+def write_vertices_and_edges(path, x_all, y_top, y_bot, l11, l12, l21, l22):
+    """
+    Load the template blockMeshDict from 'path/system/blockMeshDict',
+    replace the 'vertices' and 'edges' blocks entirely with consistent data,
+    keep the rest of the file unchanged.
+    """
+    dict_path = os.path.join(path, "system", "blockMeshDict")
+    with open(dict_path, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
 
-    l21 = [
-        """(\t""" + str(x2[i]) + "\t" + str(y2[i]) + """\t0\t)"""
-        for i in range(len(x2))
-    ]
-    l22 = [
-        """(\t""" + str(x2[i]) + "\t" + str(y2[i]) + """\t0.1\t)"""
-        for i in range(len(x2))
-    ]
+    # --- Rebuild VERTICES block ---
+    v0 = format_point(x_all[0],  y_bot[0 if len(y_bot)==0 else 0].split()[1][1:] if False else y_bot[0 if True else 0], 0.0)  # not used; we build directly below
 
-    return l11, l12, l21, l22,x1,y1,x2,y2
+    # explicit corners (match polyLine endpoints!)
+    xmin = float(x_all[0])
+    xmax = float(x_all[-1])
+    ybot_L = float(y_bot[0])
+    ybot_R = float(y_bot[-1])
+    ytop_L = float(y_top[0])
+    ytop_R = float(y_top[-1])
 
+    vertices_block = []
+    vertices_block.append("vertices")
+    vertices_block.append("(")
+    # z = 0
+    vertices_block.append(f"    {format_point(xmin, ybot_L, 0.0)}")       # 0
+    vertices_block.append(f"    {format_point(xmax, ybot_R, 0.0)}")       # 1
+    vertices_block.append(f"    {format_point(xmax, ytop_R, 0.0)}")       # 2
+    vertices_block.append(f"    {format_point(xmin, ytop_L, 0.0)}")       # 3
+    # z = THICKNESS
+    vertices_block.append(f"    {format_point(xmin, ybot_L, THICKNESS)}") # 4
+    vertices_block.append(f"    {format_point(xmax, ybot_R, THICKNESS)}") # 5
+    vertices_block.append(f"    {format_point(xmax, ytop_R, THICKNESS)}") # 6
+    vertices_block.append(f"    {format_point(xmin, ytop_L, THICKNESS)}") # 7
+    vertices_block.append(");")
 
-def build_mesh(p1, p2,p3,path):
+    v_start, v_open, v_end = find_block(lines, "vertices")
+    # Replace vertices block
+    lines = lines[:v_start] + vertices_block + lines[v_end+1:]
+
+    # --- Rebuild EDGES block ---
+    edges_block = []
+    edges_block.append("edges")
+    edges_block.append("(")
+    # bottom z=0: edge 0 1
+    edges_block.append("\tpolyLine 0 1")
+    edges_block.append("\t(")
+    for pt in l21:
+        edges_block.append("\t\t" + pt)
+    edges_block.append("\t)")
+    # bottom z=THICKNESS: edge 4 5
+    edges_block.append("\tpolyLine 4 5")
+    edges_block.append("\t(")
+    for pt in l22:
+        edges_block.append("\t\t" + pt)
+    edges_block.append("\t)")
+    # top z=0: edge 3 2
+    edges_block.append("\tpolyLine 3 2")
+    edges_block.append("\t(")
+    for pt in l11:
+        edges_block.append("\t\t" + pt)
+    edges_block.append("\t)")
+    # top z=THICKNESS: edge 7 6
+    edges_block.append("\tpolyLine 7 6")
+    edges_block.append("\t(")
+    for pt in l12:
+        edges_block.append("\t\t" + pt)
+    edges_block.append("\t)")
+    edges_block.append(");")
+
+    e_start, e_open, e_end = find_block(lines, "edges")
+    # Replace edges block
+    lines = lines[:e_start] + edges_block + lines[e_end+1:]
+
+    # Write back
+    with open(dict_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+# ------------------------------------------------
+# Main mesh pipeline
+# ------------------------------------------------
+def build_mesh(p1, p2, p3, path):
+    # Copy template case
     shutil.copytree("swakless-1", path)
-    l11, l12, l21, l22,x1,y1,x2,y2 = build_arrays(p1, p2,p3)
 
-    plt.figure()
-    #plt.scatter(x1,y1)
-    plt.plot(x1, y1, c="k")
-    plt.plot(x2, y2, c="k")
-    plt.xlim(min(x1)-0.1,max(x2)+0.1)
-    #plt.xlim(2.5,3.5)
-    plt.ylim(-0.5-2,max(x2)-2)
-    plt.grid()
-    plt.title('Reactor Geometry - p1={}, p2={}, p3={}'.format(p1, p2, p3))
-    plt.savefig(path+"/reactor_geometry.png")
+    # Build curves
+    l11, l12, l21, l22, x_all, y_top, y_bot = build_arrays(p1, p2, p3)
 
-    with open(path+"/system/blockMeshDict", "rb") as f:
-        lines = f.readlines()
+    # Optional plot for quick visual confirmation
+    if PLOT_GEOMETRY:
+        plt.figure()
+        plt.plot(x_all, y_top)
+        plt.plot(x_all, y_bot)
+        plt.xlim(min(x_all)-0.1, max(x_all)+0.1)
+        plt.ylim(min(y_bot)-0.2, max(y_top)+0.2)
+        plt.grid()
+        plt.title(f"Reactor Geometry - p1={p1:.3f}, p2={p2:.3f}, p3={p3:.3f}")
+        plt.savefig(os.path.join(path, "reactor_geometry.png"))
+        plt.close()
 
-    l = 0
-    s = []
-    s.append(str(lines[l]).split("""b'""")[-1].split("""\\n""")[0])
-    while "polyLine" not in str(lines[l]):
-        s.append(str(lines[l]).split("""b'""")[-1].split("""\\n""")[0])
-        l += 1
+    # Rebuild vertices + edges in blockMeshDict
+    write_vertices_and_edges(path, x_all, y_top, y_bot, l11, l12, l21, l22)
 
-    i = 0 
-    c = 0 
-    while i < len(s):
-        if '$' in s[i] and c in [0,4,7,3]:
-            s[i] = s[i].replace('$xmin',str(x2[0]))
-            s[i] = s[i].replace('$xmax',str(x1[0]))
-            s[i] = s[i].replace('$ymax',str(y1[0]))
-            s[i] = s[i].replace('$ymin',str(y2[0]))
-            c += 1
-            i += 1
-        elif '$' in s[i] and c in [2,6,5,1]:
-            s[i] = s[i].replace('$xmin',str(x1[-1]))
-            s[i] = s[i].replace('$xmax',str(x2[-1]))
-            s[i] = s[i].replace('$ymax',str(y1[-1]))
-            s[i] = s[i].replace('$ymin',str(y2[-1]))
-            c += 1
-            i += 1 
-        else:
-            i += 1
-
-
-    nums = ["0 1", "4 5", "3 2", "7 6"]
-    lines_add = [l21, l22, l11, l12]
-
-    for i in range(len(nums)):
-        new_poly = "	polyLine " + nums[i] + " (" + lines_add[i][0]
-        s.append(new_poly)
-        for j in range(1, len(lines_add[i])):
-            s.append(lines_add[i][j])
-        s.append(""")""")
-    s.append(""");""")
-
-    while "boundary" not in str(lines[l]):
-        l += 1
-
-    for i in range(l, len(lines)):
-        s.append(str(lines[l]).split("""b'""")[-1].split("""\\n""")[0])
-        l += 1
-
-
-    with open(path+"/system/blockMeshDict", "w") as f:
-        for item in s:
-            f.write("%s\n" % item)
-      
+    # Run blockMesh
     subprocess.run(['blockMesh', '-case', path], check=True)
-    #os.system('blockMesh -case '+path)
-    #check_mesh_output= os.system('blockMesh -case '+path)
-    check_mesh_output = subprocess.run(['checkMesh', '-case', path], capture_output=True, text=True)
-    check_mesh_output_text = check_mesh_output.stdout
 
-    if 'Failed' in check_mesh_output_text:
-        print("Mesh generation failed for {}. Deleting folder.".format(path))
+    # Run checkMesh and interpret results
+    check_mesh_output = subprocess.run(['checkMesh', '-case', path], capture_output=True, text=True)
+    out = check_mesh_output.stdout
+
+    # Extract mesh size info
+    mesh_size = None
+    for line in out.splitlines():
+        if line.strip().startswith("cells:"):
+            try:
+                mesh_size = int(line.split()[-1])
+            except Exception:
+                pass
+            break
+
+    # Decide if severe: delete or keep
+    severe_patterns = [
+        "Zero or negative face area",     # geometry collapse
+        "Zero or negative cell volume",   # geometry collapse
+        "incorrectly oriented",           # faces orientation fatal
+    ]
+    severe_hits = [p for p in severe_patterns if p in out]
+
+    if severe_hits and DELETE_ON_SEVERE:
+        print(f"[SEVERE] Deleting {path} due to:")
+        for p in severe_hits:
+            print(f"   - {p}")
+        # Also print the offending lines for quick diagnosis
+        for line in out.splitlines():
+            if any(key in line for key in severe_patterns) or "Failed" in line:
+                print("   " + line)
         shutil.rmtree(path)
         return None
-    
-    #Extract mesh size information from the checkMesh output
-    mesh_size_line = next((line for line in check_mesh_output_text.split('\n') if 'cells:' in line), None)
-    if mesh_size_line:
-        mesh_size = int(mesh_size_line.split()[1])
     else:
-        mesh_size = None
-    
+        # Log non-severe quality issues (if any), but keep the mesh
+        if "Failed" in out:
+            print(f"[WARN] Mesh quality issues for {path}:")
+            for line in out.splitlines():
+                if line.strip().startswith("***") or "Failed" in line:
+                    print("   " + line.strip())
+
     return mesh_size
 
-mesh_sizes= []
+# ------------------------------------------------
+# Batch sampling
+# ------------------------------------------------
+if __name__ == "__main__":
+    mesh_sizes = []
 
-num_samples=10
-num_dimensions=3
+    num_samples = 10
+    num_dimensions = 3
 
-sampler = qmc.LatinHypercube(d=num_dimensions)
-sample= sampler.random(n=num_samples)
+    sampler = qmc.LatinHypercube(d=num_dimensions)
+    sample = sampler.random(n=num_samples)
 
-lower_bounds= [0.1,3,0]
-upper_bounds= [0.5, 6,math.pi/2]
+    lower_bounds = [0.1, 3.0, 0.0]
+    upper_bounds = [0.5, 6.0, math.pi/2]
 
-scaled_sample = qmc.scale(sample, lower_bounds, upper_bounds)
+    scaled_sample = qmc.scale(sample, lower_bounds, upper_bounds)
 
-mesh_sizes= []
+    for i in range(num_samples):
+        p1, p2, p3 = map(float, scaled_sample[i])
+        ID = "{}_{}".format(datetime.now().strftime('%Y_%m_%d_%H_%M_%S'), uuid.uuid4().hex)
+        path = os.path.join(os.path.expanduser("~/ResearchProject/4th-Year-Research-Project/2D_Reactor/generate_mesh_1"), ID)
+        try:
+            mesh_size = build_mesh(p1, p2, p3, path)
+        except Exception as e:
+            print(f"[ERROR] Build failed for {path}: {e}")
+            mesh_size = None
+            # cleanup partial folder to avoid clutter
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+        mesh_sizes.append(mesh_size)
 
-for i in range(num_samples):
-    p1,p2,p3= scaled_sample[i]
-    ID = "{}_{}".format(datetime.now().strftime('%Y_%m_%d_%H_%M_%S'), uuid.uuid4().hex)
-    path = os.path.join(os.path.expanduser("~/ResearchProject/4th-Year-Research-Project/2D_Reactor/generate_mesh_1"), ID)
-    mesh_size=build_mesh(p1,p2,p3,path)
-    mesh_sizes.append(mesh_size)
-print(mesh_sizes)
-
-#     # print(path)
-#     # print(p1,p2,p3)
-
-# #build_mesh(0.4,4,0.2,path)
-
-# p1, p2, p3 = 0.5, 6, 1.5
-# ID = f"{datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}_{uuid.uuid4().hex}"
-# path= os.path.join('generate_mesh_1', ID)
-# build_mesh(p1,p2,p3,path)
+    print(mesh_sizes)

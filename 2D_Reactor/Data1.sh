@@ -1,46 +1,30 @@
 #!/bin/bash
-# Run OpenFOAM case from the latest generated geometry and open in ParaView
+# Run swakless test case in Results_Date_Time folder
 
 # Load OpenFOAM environment
 source /usr/lib/openfoam/openfoam2506/etc/bashrc
 
-# Find the most recent generated mesh folder from Shape_Generation.py
-baseDir=$(ls -td "$HOME/ResearchProject/4th-Year-Research-Project/2D_Reactor/generate_mesh_1"/*/ | head -1)
+# Base case: hardcoded generated folder
+baseDir="$HOME/ResearchProject/4th-Year-Research-Project/2D_Reactor/generate_mesh_1/2025_10_01_12_29_47_2fef194b42f3495b8d4feaad721b61bf"
 
-# Create a timestamped results folder
+# Results directory with timestamp
 timestamp=$(date +"%Y-%m-%d_%H-%M")
 runDir="$HOME/ResearchProject/4th-Year-Research-Project/2D_Reactor/Results_$timestamp"
 mkdir -p "$runDir"
 
-echo "Base case (generated folder): $baseDir"
-echo "Results will be stored in: $runDir"
+echo "Copying from $baseDir to $runDir"
+cp -r "$baseDir/"* "$runDir/"
 
-# Copy the generated case into Results folder
-cp -r "$baseDir"/* "$runDir/"
+# Run simulation
+cd "$runDir" || exit 1
+blockMesh
+checkMesh -allGeometry -allTopology   # add this single guard
+pimpleFoam
 
-# Ensure ParaView can recognise this as a case
+# Ensure test.foam exists for ParaView
 touch "$runDir/test.foam"
 
-# Move into results folder
-cd "$runDir" || exit 1
-
-# Always remove any old mesh to avoid stale geometry
-echo "Cleaning mesh..."
-rm -rf constant/polyMesh || true
-
-# Rebuild mesh from blockMeshDict
-echo "Running blockMesh..."
-blockMesh | tee log.blockMesh
-
-# Check mesh quality
-echo "Checking mesh..."
-checkMesh | tee log.checkMesh
-
-# Run solver
-echo "Running pimpleFoam..."
-pimpleFoam | tee log.pimpleFoam
-
-# Convert Linux path to Windows path for ParaView
+# Convert runDir path to Windows format for ParaView
 winPath=$(wslpath -w "$runDir/test.foam")
 echo "Opening in ParaView: $winPath"
 
