@@ -21,7 +21,7 @@ docker run --rm \
   -v "$runDir":/home/openfoam \
   -w /home/openfoam \
   "$IMAGE" \
-  bash -lc 'blockMesh && pimpleFoam'
+  bash -lc 'pimpleFoam'
 
 # Ensure test.foam exists for ParaView
 touch "$runDir/test.foam"

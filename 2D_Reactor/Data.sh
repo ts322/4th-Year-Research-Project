@@ -9,7 +9,7 @@ baseDir="$HOME/ResearchProject/4th-Year-Research-Project/2D_Reactor/swakless-1"
 
 # Results directory with timestamp
 timestamp=$(date +"%Y-%m-%d_%H-%M")
-runDir="$HOME/ResearchProject/4th-Year-Research-Project/2D_Reactor/Results_$timestamp"
+runDir="$HOME/ResearchProject/4th-Year-Research-Project/2D_Reactor/Results/Results_$timestamp"
 mkdir -p "$runDir"
 
 echo "Copying from $baseDir to $runDir"
